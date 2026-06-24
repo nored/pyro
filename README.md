@@ -11,6 +11,8 @@ couple of extras the usual flashers don't have.
 ## Features
 
 - **Sources:** local file, **flash from URL (streamed — writes while it downloads)**, or **clone** another drive.
+- **Erase / format:** wipe a USB stick or SD card and lay down a fresh **exFAT / FAT32 / ext4** filesystem (like Raspberry Pi Imager). exFAT is the painless cross-platform default.
+- **URL auth & history:** HTTP Basic Auth (username/password), a recent-URLs list, image name from `Content-Disposition`, and test-on-focus-off with a ✓/✗ indicator.
 - **Formats:** `.img` `.iso` `.dmg` raw, plus on-the-fly decompression of `.gz` `.xz` `.zst` `.bz2` `.zip`.
 - **Verify:** reads the drive back and checksums it after writing.
 - **bmap:** auto-detects a sibling `.bmap` and skips blank blocks for faster writes.
@@ -18,12 +20,12 @@ couple of extras the usual flashers don't have.
 - **Safety:** removable-drive detection, system disks hidden behind an explicit "unsafe" toggle, and a too-small-drive guard.
 - **Native elevation:** privileged write goes through polkit (Linux — fingerprint via `fprintd`) or the macOS auth dialog (**Touch ID**).
 - **Boot-partition config drop:** copy one or more files (e.g. `config.txt`, `ssh`, `user-data`) onto the boot partition after flashing.
-- **Boot-file editor:** optionally edit/rename/add files on the boot partition *before* ejecting.
+- **Partition picker + boot-file editor:** after writing, pick which partition to mount, then edit/rename/add files on it *before* ejecting.
 - Drag-and-drop, desktop notification, cancel, live speed/ETA, persisted settings, English + German UI.
 
 ## Platforms
 
-Linux and macOS. (Each is built on its own OS — there is no cross-compile for macOS.)
+Linux and macOS. Each is built on its own OS — there is no cross-compile, so a macOS `.dmg`/`.app` must be built on a Mac.
 
 ## Develop
 
@@ -35,16 +37,26 @@ npm run tauri:dev
 ## Build
 
 ```sh
+npm install
 npm run tauri:build           # all default bundles for the host OS
-npm run tauri:build -- --bundles appimage   # Linux AppImage only
+npm run tauri:build -- --bundles appimage   # Linux: AppImage only
 ```
+
+`tauri:build` automatically builds and stages the privileged `pyro-helper`
+(`scripts/stage-helper.mjs` → `src-tauri/binaries/pyro-helper-<target-triple>`),
+so it gets bundled next to the main binary in the AppImage / `.app`.
 
 ### Requirements
 
 - Rust toolchain + Node.js.
-- **Linux:** webkit2gtk-4.1, a polkit auth agent, `lsblk`, `mount`/`umount`, `partprobe`.
+- **Linux:** webkit2gtk-4.1, a polkit auth agent, `lsblk`, `mount`/`umount`, `partprobe`, `parted`, `wipefs`.
   For fingerprint auth: install `fprintd`, enrol a finger, and make sure polkit's PAM stack uses `pam_fprintd`.
-- **macOS:** nothing extra; Touch ID works through the system auth dialog if configured.
+  For the Erase feature: `exfatprogs` (exFAT), `dosfstools` (FAT32), `e2fsprogs` (ext4).
+- **macOS:** Xcode Command Line Tools (`xcode-select --install`). Everything else — disk formatting (`diskutil`),
+  Touch ID elevation (system auth dialog) — is built in. A Mac `.dmg`/`.app` must be built on a Mac.
+
+> The macOS `.app` bundles `pyro-helper` in `Contents/MacOS/`; Pyro runs it via
+> the system administrator dialog (Touch ID) when you flash or erase.
 
 ## License
 

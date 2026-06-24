@@ -6,7 +6,7 @@
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "node scripts/stage-helper.mjs && npm run dev",
     "beforeBuildCommand": "node scripts/stage-helper.mjs && npm run build"
   },
   "app": {
@@ -39,6 +39,9 @@
     ],
     "category": "Utility",
     "shortDescription": "Flash OS images to USB drives & SD cards",
-    "longDescription": "Pyro writes and verifies OS images to USB drives and SD cards, with native fingerprint/Touch ID elevation and optional boot-partition config injection."
+    "longDescription": "Pyro writes and verifies OS images to USB drives and SD cards, with native fingerprint/Touch ID elevation and optional boot-partition config injection.",
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    }
   }
 }
