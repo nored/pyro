@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["src-tauri", "crates/pyro-helper"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Pyro contributors"]
+license = "MIT"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

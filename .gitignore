@@ -1,0 +1,23 @@
+# dependencies / build output
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# rust / tauri
+src-tauri/target/
+src-tauri/gen/
+
+# reference clones (balena etcher + rpi-imager) — reference only, not part of Pyro
+upstream/
+
+# local harness state
+.claude/
+
+# misc
+*.log
+.DS_Store
+.env
+
+# rust workspace build output (root)
+/target/

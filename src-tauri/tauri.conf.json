@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Pyro",
+  "version": "0.1.0",
+  "identifier": "dev.pyro.flasher",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Pyro",
+        "width": 980,
+        "height": 640,
+        "minWidth": 820,
+        "minHeight": 560,
+        "resizable": true,
+        "backgroundColor": "#0f1115"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.png",
+      "icons/icon.ico",
+      "icons/icon.icns"
+    ],
+    "category": "Utility",
+    "shortDescription": "Flash OS images to USB drives & SD cards",
+    "longDescription": "Pyro writes and verifies OS images to USB drives and SD cards, with native fingerprint/Touch ID elevation and optional boot-partition config injection."
+  }
+}

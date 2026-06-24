@@ -1,0 +1,20 @@
+[package]
+name = "pyro-helper"
+version = "0.1.0"
+edition = "2021"
+description = "Privileged flashing helper for Pyro"
+
+[[bin]]
+name = "pyro-helper"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+flate2 = "1"
+xz2 = "0.1"
+zstd = "0.13"
+bzip2 = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+ureq = "2"
