@@ -15,6 +15,7 @@ upstream/
 
 # local harness state
 .claude/
+CLAUDE.local.md
 
 # misc
 *.log
