@@ -4,7 +4,7 @@
 export const BRAND = {
   name: 'Pyro',
   tagline: 'Flash OS images to USB drives & SD cards',
-  version: '0.1.0',
+  version: '0.2.0',
   appId: 'dev.pyro.flasher',
   /** lowercase executable / config-dir name */
   slug: 'pyro',

@@ -14,6 +14,14 @@ pub struct DriveInfo {
     pub mountpoints: Vec<String>,
 }
 
+/// Optional HTTP Basic Auth credentials for a URL source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpAuth {
+    pub username: String,
+    pub password: String,
+}
+
 /// A source image selected by the user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +35,19 @@ pub struct ImageInfo {
     /// Path to an auto-detected sibling .bmap file, if any.
     #[serde(default)]
     pub bmap_path: Option<String>,
+    /// HTTP Basic Auth for a URL source (carried through to the flasher).
+    #[serde(default)]
+    pub auth: Option<HttpAuth>,
+}
+
+/// Erase a device and lay down a single fresh filesystem instead of flashing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormatSpec {
+    /// "exfat" | "fat32" | "ext4"
+    pub filesystem: String,
+    /// Volume label (may be empty).
+    pub label: String,
 }
 
 /// A request to flash an image to one or more devices.
@@ -41,6 +62,9 @@ pub struct FlashRequest {
     /// Keep the boot partition mounted for in-app editing before eject.
     #[serde(default)]
     pub edit_boot: bool,
+    /// If set, erase & format the devices instead of writing an image.
+    #[serde(default)]
+    pub format: Option<FormatSpec>,
 }
 
 // Progress is forwarded to the UI as raw JSON tailed from the helper's progress
@@ -57,4 +81,6 @@ pub struct FlashResult {
     pub checksum: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }

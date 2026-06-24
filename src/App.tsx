@@ -1,11 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type FocusEvent } from 'react';
 import type {
   BootEntry,
   DownloadProgress,
   DriveInfo,
   FlashProgress,
   FlashResult,
+  FormatSpec,
   ImageInfo,
+  PartitionInfo,
   Settings,
 } from '@shared/types';
 import { BRAND } from '@shared/brand';
@@ -17,6 +19,10 @@ import { LANGS, setLang, t, type Lang } from './i18n';
 const GLOBAL = '__global';
 
 type SourceOpts = { temp?: string; clone?: string };
+
+function fsLabel(fs: string): string {
+  return fs === 'exfat' ? 'exFAT' : fs === 'fat32' ? 'FAT32' : fs === 'ext4' ? 'ext4' : fs;
+}
 
 function cloneImage(d: DriveInfo): ImageInfo {
   return {
@@ -31,6 +37,8 @@ function cloneImage(d: DriveInfo): ImageInfo {
 
 export default function App() {
   const [image, setImage] = useState<ImageInfo | null>(null);
+  const [formatSpec, setFormatSpec] = useState<FormatSpec | null>(null);
+  const [platform, setPlatform] = useState<string>('linux');
   const [cloneSource, setCloneSource] = useState<string | null>(null);
   const [tempPath, setTempPath] = useState<string | null>(null);
   const [drives, setDrives] = useState<DriveInfo[]>([]);
@@ -43,6 +51,10 @@ export default function App() {
   const [dragging, setDragging] = useState(false);
   const [editBoot, setEditBoot] = useState(false);
   const [editing, setEditing] = useState<{ dir: string } | null>(null);
+  const [choosing, setChoosing] = useState<{
+    device: string;
+    partitions: PartitionInfo[];
+  } | null>(null);
   const [editAddNonce, setEditAddNonce] = useState(0);
   const editingRef = useRef<{ dir: string } | null>(null);
   editingRef.current = editing;
@@ -64,11 +76,20 @@ export default function App() {
   useEffect(() => {
     refreshDrives();
     pyro.getSettings().then(setSettings);
+    pyro.osPlatform().then(setPlatform).catch(() => {});
     const offDrives = pyro.onDrivesChanged(setDrives);
     const offProgress = pyro.onFlashProgress((p) => {
+      // The 'choose' event carries a partition list, not flash progress.
+      if (p.phase === 'choose') {
+        if (p.partitions?.length) {
+          setChoosing({ device: p.device ?? '', partitions: p.partitions });
+        }
+        return;
+      }
       setProgress((prev) => ({ ...prev, [p.device ?? GLOBAL]: p }));
       // The helper signals the editor is ready and sends the mountpoint.
       if (p.phase === 'editing' && p.message) {
+        setChoosing(null);
         setEditing({ dir: p.message });
       }
     });
@@ -85,15 +106,37 @@ export default function App() {
         return opts.temp ?? null;
       });
       setImage(img);
+      setFormatSpec(null);
       setCloneSource(opts.clone ?? null);
       setResults(null);
     },
     [],
   );
 
+  // "Erase" mode: no real image — a synthetic source stands in so the drive and
+  // flash steps light up, with the format spec carried alongside.
+  const handleErase = useCallback((spec: FormatSpec) => {
+    setTempPath((old) => {
+      if (old) void pyro.forgetTemp(old);
+      return null;
+    });
+    setImage({
+      path: '',
+      name: `Erase → ${fsLabel(spec.filesystem)}`,
+      fileSize: 0,
+      uncompressedSize: 0,
+      compression: 'none',
+      bmapPath: null,
+    });
+    setFormatSpec(spec);
+    setCloneSource(null);
+    setResults(null);
+  }, []);
+
   const clearSource = () => {
     if (tempPath) void pyro.forgetTemp(tempPath);
     setImage(null);
+    setFormatSpec(null);
     setCloneSource(null);
     setTempPath(null);
     setResults(null);
@@ -158,9 +201,10 @@ export default function App() {
       const res = await pyro.startFlash({
         image,
         devices,
-        validate: settings.validate,
-        bootConfigFiles: bootConfigs,
-        editBoot,
+        validate: formatSpec ? false : settings.validate,
+        bootConfigFiles: formatSpec ? [] : bootConfigs,
+        editBoot: formatSpec ? false : editBoot,
+        format: formatSpec,
       });
       setResults(res);
       if (settings.notifications) await notifyDone(res);
@@ -177,6 +221,7 @@ export default function App() {
       setFlashing(false);
       setProgress({});
       setEditing(null);
+      setChoosing(null);
       refreshDrives();
     }
   };
@@ -215,6 +260,20 @@ export default function App() {
         />
       )}
 
+      {choosing && (
+        <PartitionChooser
+          partitions={choosing.partitions}
+          onPick={(p) => {
+            void pyro.choosePartition(p.path);
+            setChoosing(null);
+          }}
+          onSkip={() => {
+            void pyro.choosePartition('');
+            setChoosing(null);
+          }}
+        />
+      )}
+
       {results ? (
         <ResultView results={results} onAgain={reset} />
       ) : editing ? (
@@ -239,9 +298,16 @@ export default function App() {
               <div className="body">
                 <SourceSelector
                   image={image}
+                  formatSpec={formatSpec}
+                  platform={platform}
                   drives={drives}
                   dragging={dragging}
+                  recentUrls={settings.recentUrls ?? []}
+                  onRecentUrls={(urls) =>
+                    setSettings((prev) => ({ ...prev, recentUrls: urls }))
+                  }
                   onSource={handleSource}
+                  onErase={handleErase}
                   onClear={clearSource}
                 />
               </div>
@@ -268,32 +334,36 @@ export default function App() {
               </div>
             </section>
 
-            <section className={`step ${!image ? 'disabled' : ''}`}>
-              <span className="step-num">3 · {t('step.options')}</span>
-              <h2>{t('options.title')}</h2>
-              <div className="body" style={{ justifyContent: 'flex-start', paddingTop: 6 }}>
-                <BootConfigList
-                  files={bootConfigs}
-                  dragging={dragging}
-                  onAdd={async () => addBootConfigs(await pyro.selectBootConfigFiles())}
-                  onRemove={(f) =>
-                    setBootConfigs((cur) => cur.filter((x) => x !== f))
-                  }
-                />
-                <label className="edit-toggle">
-                  <input
-                    type="checkbox"
-                    checked={editBoot}
-                    onChange={(e) => setEditBoot(e.target.checked)}
+            {!formatSpec && (
+              <section className={`step ${!image ? 'disabled' : ''}`}>
+                <span className="step-num">3 · {t('step.options')}</span>
+                <h2>{t('options.title')}</h2>
+                <div className="body">
+                  <BootConfigList
+                    files={bootConfigs}
+                    dragging={dragging}
+                    onAdd={async () => addBootConfigs(await pyro.selectBootConfigFiles())}
+                    onRemove={(f) =>
+                      setBootConfigs((cur) => cur.filter((x) => x !== f))
+                    }
                   />
-                  {t('options.editToggle')}
-                </label>
-              </div>
-            </section>
+                  <label className="edit-toggle">
+                    <input
+                      type="checkbox"
+                      checked={editBoot}
+                      onChange={(e) => setEditBoot(e.target.checked)}
+                    />
+                    {t('options.editToggle')}
+                  </label>
+                </div>
+              </section>
+            )}
 
             <section className={`step flash-step ${!canFlash && !flashing ? 'disabled' : ''}`}>
-              <span className="step-num">4 · {t('step.flash')}</span>
-              <h2>{t('flash.ready')}</h2>
+              <span className="step-num">
+                {formatSpec ? '3' : '4'} · {formatSpec ? t('step.erase') : t('step.flash')}
+              </span>
+              <h2>{formatSpec ? t('erase.ready') : t('flash.ready')}</h2>
               <div className="body">
                 {flashing ? (
                   <>
@@ -316,13 +386,15 @@ export default function App() {
                   <>
                     <button className="btn-flash" disabled={!canFlash} onClick={flash}>
                       <FlameIcon />
-                      <span>{t('flash.button')}</span>
+                      <span>{formatSpec ? t('erase.button') : t('flash.button')}</span>
                     </button>
                     <p className="muted" style={{ fontSize: 12, marginTop: 10 }}>
                       {canFlash
-                        ? selectedDrives.length > 1
-                          ? t('flash.readyN', { n: selectedDrives.length })
-                          : t('flash.ready')
+                        ? formatSpec
+                          ? t('erase.willErase', { n: selectedDrives.length })
+                          : selectedDrives.length > 1
+                            ? t('flash.readyN', { n: selectedDrives.length })
+                            : t('flash.ready')
                         : t('flash.notReady')}
                     </p>
                   </>
@@ -348,31 +420,49 @@ async function notifyDone(results: FlashResult[]) {
 
 function SourceSelector({
   image,
+  formatSpec,
+  platform,
   drives,
   dragging,
+  recentUrls,
+  onRecentUrls,
   onSource,
+  onErase,
   onClear,
 }: {
   image: ImageInfo | null;
+  formatSpec: FormatSpec | null;
+  platform: string;
   drives: DriveInfo[];
   dragging: boolean;
+  recentUrls: string[];
+  onRecentUrls: (urls: string[]) => void;
   onSource: (img: ImageInfo, opts?: SourceOpts) => void;
+  onErase: (spec: FormatSpec) => void;
   onClear: () => void;
 }) {
-  const [mode, setMode] = useState<'idle' | 'url' | 'clone'>('idle');
+  const [mode, setMode] = useState<'idle' | 'url' | 'clone' | 'erase'>('idle');
   const [url, setUrl] = useState('');
+  const [user, setUser] = useState('');
+  const [pass, setPass] = useState('');
+  const [showAuth, setShowAuth] = useState(false);
+  const [eraseLabel, setEraseLabel] = useState('PYRO');
   const [dl, setDl] = useState<DownloadProgress | null>(null);
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // null = untested, true = reachable, false = last test failed
+  const [tested, setTested] = useState<boolean | null>(null);
 
   if (image) {
     return (
       <div className="pick">
         <div className="name">{image.name}</div>
         <div className="sub">
-          {formatBytes(image.fileSize)}
-          {image.compression !== 'none' ? ` · ${image.compression}` : ''}
-          {image.bmapPath ? ' · bmap ⚡' : ''}
+          {formatSpec
+            ? `${t('erase.cardSub')}${formatSpec.label ? ` · ${formatSpec.label}` : ''}`
+            : `${formatBytes(image.fileSize)}${
+                image.compression !== 'none' ? ` · ${image.compression}` : ''
+              }${image.bmapPath ? ' · bmap ⚡' : ''}`}
         </div>
         <button className="link" onClick={onClear}>
           {t('source.change')}
@@ -402,19 +492,25 @@ function SourceSelector({
     if (img) onSource(img);
   };
 
-  const fetchUrl = async () => {
-    if (!url.trim()) return;
+  const fetchUrl = async (target?: string) => {
+    const u = (target ?? url).trim();
+    if (!u || checking) return;
+    const auth = user.trim() ? { username: user, password: pass } : null;
     setError(null);
+    setTested(null);
     setChecking(true);
     try {
-      const info = await pyro.inspectUrl(url.trim());
+      const info = await pyro.inspectUrl(u, auth);
+      // Remember it (server de-dupes & caps) for the recent list.
+      pyro.addRecentUrl(u).then(onRecentUrls).catch(() => {});
+      setTested(true);
       if (info.compression === 'zip') {
         // Zip can't be streamed (needs random access) — download to a temp file.
         setChecking(false);
         setDl({ fraction: 0, bytes: 0, totalBytes: null, speed: 0, eta: null });
         const off = pyro.onDownloadProgress(setDl);
         try {
-          const img = await pyro.downloadImage(url.trim());
+          const img = await pyro.downloadImage(u, auth);
           onSource(img, { temp: img.path });
         } finally {
           off();
@@ -422,15 +518,26 @@ function SourceSelector({
         }
       } else {
         // Stream directly to the device during flashing (write-while-download).
-        onSource(info);
+        onSource({ ...info, auth });
       }
       setMode('idle');
       setUrl('');
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      setTested(false);
     } finally {
       setChecking(false);
     }
+  };
+
+  // Test the URL when focus leaves the whole URL group (input + auth fields),
+  // unless the user is just switching source tabs.
+  const onGroupBlur = (e: FocusEvent<HTMLDivElement>) => {
+    const next = e.relatedTarget as HTMLElement | null;
+    if (next && e.currentTarget.contains(next)) return;
+    if (next && next.closest('.source-tabs')) return;
+    if (!url.trim() || checking) return;
+    void fetchUrl();
   };
 
   return (
@@ -454,6 +561,12 @@ function SourceSelector({
         >
           {t('source.clone')}
         </button>
+        <button
+          className={`tab ${mode === 'erase' ? 'active' : ''}`}
+          onClick={() => setMode('erase')}
+        >
+          {t('source.erase')}
+        </button>
       </div>
 
       {mode === 'idle' && (
@@ -471,19 +584,92 @@ function SourceSelector({
       )}
 
       {mode === 'url' && (
-        <div style={{ display: 'grid', gap: 8, marginTop: 12 }}>
-          <input
-            className="url-input"
-            placeholder={t('source.urlPlaceholder')}
-            value={url}
-            autoFocus
-            onChange={(e) => setUrl(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && fetchUrl()}
-          />
-          {error && <span style={{ color: 'var(--bad)', fontSize: 12 }}>{error}</span>}
-          <button className="btn primary" onClick={fetchUrl} disabled={checking}>
-            {checking ? t('source.checking') : t('source.fetch')}
-          </button>
+        <div style={{ display: 'grid', gap: 8, marginTop: 12 }} onBlur={onGroupBlur}>
+          <div className="url-field">
+            <input
+              className="url-input"
+              placeholder={t('source.urlPlaceholder')}
+              value={url}
+              autoFocus
+              disabled={checking}
+              onChange={(e) => {
+                setUrl(e.target.value);
+                setTested(null);
+                setError(null);
+              }}
+              onKeyDown={(e) => e.key === 'Enter' && fetchUrl()}
+            />
+            <span className="url-status" aria-hidden>
+              {checking ? (
+                <span className="url-spinner" />
+              ) : tested === true ? (
+                <span style={{ color: 'var(--good)' }}>✓</span>
+              ) : tested === false ? (
+                <span style={{ color: 'var(--bad)' }}>✗</span>
+              ) : null}
+            </span>
+          </div>
+
+          {showAuth ? (
+            <div style={{ display: 'grid', gap: 6 }}>
+              <input
+                className="url-input"
+                placeholder={t('source.username')}
+                value={user}
+                autoComplete="off"
+                onChange={(e) => {
+                  setUser(e.target.value);
+                  setTested(null);
+                }}
+                onKeyDown={(e) => e.key === 'Enter' && fetchUrl()}
+              />
+              <input
+                className="url-input"
+                type="password"
+                placeholder={t('source.password')}
+                value={pass}
+                autoComplete="off"
+                onChange={(e) => {
+                  setPass(e.target.value);
+                  setTested(null);
+                }}
+                onKeyDown={(e) => e.key === 'Enter' && fetchUrl()}
+              />
+            </div>
+          ) : (
+            <button
+              className="link"
+              style={{ justifySelf: 'start', fontSize: 12 }}
+              onClick={() => setShowAuth(true)}
+            >
+              {t('source.addAuth')}
+            </button>
+          )}
+
+          {error && (
+            <span style={{ color: 'var(--bad)', fontSize: 12 }}>{error}</span>
+          )}
+
+          {recentUrls.length > 0 && (
+            <div className="recent-urls">
+              <div className="sub" style={{ marginBottom: 2 }}>
+                {t('source.recent')}
+              </div>
+              {recentUrls.map((r) => (
+                <button
+                  key={r}
+                  className="recent-url"
+                  title={r}
+                  onClick={() => {
+                    setUrl(r);
+                    void fetchUrl(r);
+                  }}
+                >
+                  {baseName(r.split('?')[0])}
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -506,6 +692,40 @@ function SourceSelector({
               ))}
             </div>
           )}
+        </div>
+      )}
+
+      {mode === 'erase' && (
+        <div style={{ marginTop: 12, display: 'grid', gap: 10 }}>
+          <p className="muted" style={{ fontSize: 12 }}>
+            {t('erase.hint')}
+          </p>
+          <label className="erase-label">
+            <span className="sub">{t('erase.label')}</span>
+            <input
+              className="url-input"
+              value={eraseLabel}
+              maxLength={15}
+              onChange={(e) => setEraseLabel(e.target.value)}
+            />
+          </label>
+          <div className="sub">{t('erase.choose')}</div>
+          <div style={{ display: 'grid', gap: 6 }}>
+            {['exfat', 'fat32', ...(platform === 'macos' ? [] : ['ext4'])].map((fs) => (
+              <button
+                key={fs}
+                className="pick"
+                style={{ textAlign: 'left' }}
+                onClick={() => onErase({ filesystem: fs, label: eraseLabel.trim() })}
+              >
+                <div className="name">
+                  {fsLabel(fs)}
+                  {fs === 'exfat' ? ` · ${t('erase.recommended')}` : ''}
+                </div>
+                <div className="sub">{t(`erase.fs.${fs}`)}</div>
+              </button>
+            ))}
+          </div>
         </div>
       )}
     </div>
@@ -648,7 +868,7 @@ function DriveRow({
       >
         {selected ? '✓' : ''}
       </span>
-      <span style={{ minWidth: 0 }}>
+      <span style={{ flex: 1, minWidth: 0 }}>
         <div className="name">{drive.description}</div>
         <div className="sub">
           {drive.device} · {formatBytes(drive.size)}
@@ -680,18 +900,16 @@ function FlashProgressView({
         if (!p) return null;
         return (
           <div key={dev}>
-            {devices.length > 1 && (
-              <div className="muted" style={{ fontSize: 12 }}>
-                {label(dev)}
-              </div>
-            )}
+            <div className="phase-label">
+              {devices.length > 1 && (
+                <span className="muted">{label(dev)} · </span>
+              )}
+              <b>{t(`phase.${p.phase}`)}</b>
+            </div>
             <div className="progress">
               <i style={{ width: `${Math.round(p.fraction * 100)}%` }} />
             </div>
             <div className="stat-row">
-              <span>
-                <b>{t(`phase.${p.phase}`)}</b>
-              </span>
               <span>{Math.round(p.fraction * 100)}%</span>
               {p.speed > 0 && <span>{formatSpeed(p.speed)}</span>}
               {p.eta != null && (
@@ -701,6 +919,51 @@ function FlashProgressView({
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function PartitionChooser({
+  partitions,
+  onPick,
+  onSkip,
+}: {
+  partitions: PartitionInfo[];
+  onPick: (p: PartitionInfo) => void;
+  onSkip: () => void;
+}) {
+  return (
+    <div className="modal-overlay" onClick={onSkip}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h2 style={{ marginTop: 0 }}>{t('choose.title')}</h2>
+        <p className="muted" style={{ fontSize: 13, marginTop: -6 }}>
+          {t('choose.subtitle')}
+        </p>
+        <div style={{ display: 'grid', gap: 8, margin: '12px 0' }}>
+          {partitions.map((p) => (
+            <button
+              key={p.path}
+              className="pick"
+              style={{ display: 'flex', alignItems: 'center', gap: 10, textAlign: 'left' }}
+              onClick={() => onPick(p)}
+            >
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <div className="name">{p.label || baseName(p.path)}</div>
+                <div className="sub">
+                  {p.path} · {p.fstype || t('choose.unknownFs')}
+                  {p.size > 0 ? ` · ${formatBytes(p.size)}` : ''}
+                </div>
+              </span>
+            </button>
+          ))}
+        </div>
+        <div className="modal-footer">
+          <span style={{ flex: 1 }} />
+          <button className="btn ghost" onClick={onSkip}>
+            {t('choose.skip')}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -962,12 +1225,19 @@ function ResultView({
         {ok ? t('result.complete') : t('result.failed')}
       </h1>
       {results.map((r) => (
-        <p key={r.device} className="muted">
-          {r.device}:{' '}
-          {r.ok
-            ? t('result.written', { bytes: formatBytes(r.bytesWritten) })
-            : r.error}
-        </p>
+        <div key={r.device}>
+          <p className="muted">
+            {r.device}:{' '}
+            {r.ok
+              ? t('result.written', { bytes: formatBytes(r.bytesWritten) })
+              : r.error}
+          </p>
+          {r.warning && (
+            <p className="muted" style={{ color: 'var(--ember-2)', fontSize: 12 }}>
+              note: {r.warning}
+            </p>
+          )}
+        </div>
       ))}
       <button className="btn primary" onClick={onAgain} style={{ marginTop: 16 }}>
         {t('result.again')}

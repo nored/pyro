@@ -1,5 +1,6 @@
 //! Source image readers: transparent decompression with byte accounting.
 
+use base64::Engine;
 use std::fs::File;
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,11 +33,24 @@ impl<R: Read> Read for CountingReader<R> {
 }
 
 /// Open the raw source bytes for an image path, which may be a local file or an
-/// `http(s)://` URL (streamed). Returns a reader the caller wraps for
-/// decompression.
-pub fn open_raw(image_path: &str) -> io::Result<Box<dyn Read + Send>> {
+/// `http(s)://` URL (streamed). Optional `username`/`password` add an HTTP Basic
+/// Auth header. Returns a reader the caller wraps for decompression.
+pub fn open_raw(
+    image_path: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> io::Result<Box<dyn Read + Send>> {
     if image_path.starts_with("http://") || image_path.starts_with("https://") {
-        let resp = ureq::get(image_path)
+        let mut req = ureq::get(image_path);
+        if let Some(user) = username {
+            let raw = format!("{}:{}", user, password.unwrap_or(""));
+            let header = format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(raw)
+            );
+            req = req.set("Authorization", &header);
+        }
+        let resp = req
             .call()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("download failed: {e}")))?;
         Ok(Box::new(resp.into_reader()))

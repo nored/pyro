@@ -8,6 +8,7 @@ import type {
   FlashProgress,
   FlashRequest,
   FlashResult,
+  HttpAuth,
   ImageInfo,
   PyroApi,
   Settings,
@@ -32,9 +33,13 @@ export const pyro: PyroApi = {
   inspectImage: (path: string) =>
     invoke<ImageInfo | null>('inspect_image', { path }),
 
-  inspectUrl: (url: string) => invoke<ImageInfo>('inspect_url', { url }),
+  inspectUrl: (url: string, auth?: HttpAuth | null) =>
+    invoke<ImageInfo>('inspect_url', { url, auth: auth ?? null }),
 
-  downloadImage: (url: string) => invoke<ImageInfo>('download_image', { url }),
+  downloadImage: (url: string, auth?: HttpAuth | null) =>
+    invoke<ImageInfo>('download_image', { url, auth: auth ?? null }),
+
+  addRecentUrl: (url: string) => invoke<string[]>('add_recent_url', { url }),
 
   onDownloadProgress: (cb) => {
     const unlisten = listen<DownloadProgress>('download-progress', (e) =>
@@ -56,6 +61,8 @@ export const pyro: PyroApi = {
   cancelFlash: () => invoke<void>('cancel_flash'),
 
   finishEdit: () => invoke<void>('finish_edit'),
+
+  choosePartition: (path: string) => invoke<void>('choose_partition', { path }),
 
   bootList: (dir: string) => invoke<BootEntry[]>('boot_list', { dir }),
 
@@ -107,4 +114,6 @@ export const pyro: PyroApi = {
     invoke<void>('set_settings', { settings }),
 
   openExternal: (url: string) => invoke<void>('open_external', { url }),
+
+  osPlatform: () => invoke<string>('os_platform'),
 };

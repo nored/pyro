@@ -184,10 +184,11 @@ button {
 }
 .step .body {
   flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
+  align-items: stretch;
+  justify-content: flex-start;
   text-align: center;
   gap: 10px;
 }
@@ -229,6 +230,9 @@ button {
 /* ---- selected item card ---- */
 .pick {
   width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
   background: var(--bg-elev-2);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -278,8 +282,19 @@ button {
   width: 0;
   transition: width 0.2s ease;
 }
+/* Phase name (e.g. "flashing") sits above the bar on its own line. */
+.phase-label {
+  font-size: 13px;
+  margin-bottom: 6px;
+  text-align: left;
+}
+.phase-label b {
+  color: var(--text);
+  font-weight: 600;
+}
 .stat-row {
   display: flex;
+  justify-content: space-between;
   gap: 18px;
   color: var(--text-dim);
   font-size: 12px;
@@ -303,6 +318,74 @@ button {
 .url-input:focus {
   outline: none;
   border-color: var(--ember);
+}
+
+/* URL input with an inline test-status icon (✓ / ✗ / spinner) */
+.url-field {
+  position: relative;
+}
+.url-field .url-input {
+  padding-right: 34px;
+}
+.url-status {
+  position: absolute;
+  right: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+}
+.url-spinner {
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--border);
+  border-top-color: var(--ember);
+  border-radius: 50%;
+  animation: url-spin 0.7s linear infinite;
+}
+@keyframes url-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Erase / format panel */
+.erase-label {
+  display: grid;
+  gap: 4px;
+  text-align: left;
+}
+
+/* Recent URLs list */
+.recent-urls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.recent-url {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.recent-url:hover {
+  border-color: var(--ember);
+  color: var(--text);
 }
 
 /* ---- settings modal ---- */

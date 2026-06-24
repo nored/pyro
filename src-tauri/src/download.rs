@@ -8,8 +8,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
-use crate::commands::detect_compression;
-use crate::models::ImageInfo;
+use crate::commands::{basic_auth_header, detect_compression, filename_from_disposition};
+use crate::models::{HttpAuth, ImageInfo};
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -31,16 +31,31 @@ fn url_basename(url: &str) -> String {
 }
 
 #[tauri::command]
-pub fn download_image(app: AppHandle, url: String) -> Result<ImageInfo, String> {
+pub fn download_image(
+    app: AppHandle,
+    url: String,
+    auth: Option<HttpAuth>,
+) -> Result<ImageInfo, String> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("URL must start with http:// or https://".into());
     }
-    let resp = ureq::get(&url)
-        .call()
-        .map_err(|e| format!("download failed: {e}"))?;
+    let mut req = ureq::get(&url);
+    if let Some(a) = &auth {
+        req = req.set("Authorization", &basic_auth_header(a));
+    }
+    let resp = req.call().map_err(|e| match e {
+        ureq::Error::Status(401, _) | ureq::Error::Status(403, _) => {
+            "authentication required or failed for this URL".to_string()
+        }
+        other => format!("download failed: {other}"),
+    })?;
     let total: Option<u64> = resp
         .header("Content-Length")
         .and_then(|s| s.parse::<u64>().ok());
+    let resolved_name = resp
+        .header("Content-Disposition")
+        .and_then(filename_from_disposition)
+        .unwrap_or_else(|| url_basename(&url));
 
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -106,7 +121,7 @@ pub fn download_image(app: AppHandle, url: String) -> Result<ImageInfo, String> 
     let file_size = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(downloaded);
     Ok(ImageInfo {
         path: tmp.to_string_lossy().to_string(),
-        name: url_basename(&url),
+        name: resolved_name,
         file_size,
         uncompressed_size: if compression == "none" {
             Some(file_size)
@@ -115,5 +130,7 @@ pub fn download_image(app: AppHandle, url: String) -> Result<ImageInfo, String> 
         },
         compression,
         bmap_path: None,
+        // The download lands as a local temp file; no auth needed downstream.
+        auth: None,
     })
 }

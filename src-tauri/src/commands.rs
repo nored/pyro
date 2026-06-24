@@ -2,8 +2,44 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
+use base64::Engine;
+
 use crate::drives;
-use crate::models::{DriveInfo, ImageInfo};
+use crate::models::{DriveInfo, HttpAuth, ImageInfo};
+
+/// Build an HTTP `Authorization: Basic …` header value from credentials.
+pub fn basic_auth_header(auth: &HttpAuth) -> String {
+    let raw = format!("{}:{}", auth.username, auth.password);
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    )
+}
+
+/// Pull a filename out of a Content-Disposition header, if present.
+pub fn filename_from_disposition(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let idx = lower.find("filename=")?;
+    let raw = value[idx + "filename=".len()..].trim();
+    let raw = raw.split(';').next().unwrap_or(raw).trim();
+    let raw = raw.trim_matches('"');
+    let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw).trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn url_basename(url: &str) -> String {
+    url.split('?')
+        .next()
+        .unwrap_or(url)
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or("image")
+        .to_string()
+}
 
 /// Detect compression from the leading magic bytes.
 pub fn detect_compression_bytes(b: &[u8]) -> String {
@@ -31,28 +67,31 @@ pub fn detect_compression(path: &Path) -> String {
 /// the leading magic bytes, so the UI can show size/format and the flasher can
 /// stream it directly to the device.
 #[tauri::command]
-pub fn inspect_url(url: String) -> Result<ImageInfo, String> {
+pub fn inspect_url(url: String, auth: Option<HttpAuth>) -> Result<ImageInfo, String> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("URL must start with http:// or https://".into());
     }
-    let resp = ureq::get(&url)
-        .call()
-        .map_err(|e| format!("could not reach URL: {e}"))?;
+    let mut req = ureq::get(&url);
+    if let Some(a) = &auth {
+        req = req.set("Authorization", &basic_auth_header(a));
+    }
+    let resp = req.call().map_err(|e| match e {
+        ureq::Error::Status(401, _) | ureq::Error::Status(403, _) => {
+            "authentication required or failed for this URL".to_string()
+        }
+        other => format!("could not reach URL: {other}"),
+    })?;
     let file_size = resp
         .header("Content-Length")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
+    let name = resp
+        .header("Content-Disposition")
+        .and_then(filename_from_disposition)
+        .unwrap_or_else(|| url_basename(&url));
     let mut head = [0u8; 8];
     let n = resp.into_reader().read(&mut head).unwrap_or(0);
     let compression = detect_compression_bytes(&head[..n]);
-    let name = url
-        .split('?')
-        .next()
-        .unwrap_or(&url)
-        .rsplit('/')
-        .find(|s| !s.is_empty())
-        .unwrap_or("image")
-        .to_string();
     Ok(ImageInfo {
         path: url,
         name,
@@ -64,6 +103,7 @@ pub fn inspect_url(url: String) -> Result<ImageInfo, String> {
         },
         compression,
         bmap_path: None,
+        auth,
     })
 }
 
@@ -107,6 +147,7 @@ fn build_image_info(path: &Path) -> Option<ImageInfo> {
         },
         compression,
         bmap_path: find_bmap(path),
+        auth: None,
     })
 }
 
@@ -162,6 +203,13 @@ pub fn forget_temp(path: String) {
     if p.starts_with(std::env::temp_dir()) {
         let _ = fs::remove_file(p);
     }
+}
+
+/// The host OS ("linux", "macos", "windows", …) so the UI can hide options that
+/// don't apply (e.g. ext4 formatting on macOS).
+#[tauri::command]
+pub fn os_platform() -> String {
+    std::env::consts::OS.to_string()
 }
 
 #[tauri::command]

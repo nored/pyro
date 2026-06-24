@@ -7,6 +7,8 @@ dist/
 # rust / tauri
 src-tauri/target/
 src-tauri/gen/
+# staged helper binary (rebuilt by scripts/stage-helper.mjs at bundle time)
+src-tauri/binaries/
 
 # reference clones (balena etcher + rpi-imager) — reference only, not part of Pyro
 upstream/

@@ -9,6 +9,7 @@
 
 mod bmap;
 mod bootconfig;
+mod format;
 mod source;
 
 use std::fs::{File, OpenOptions};
@@ -27,6 +28,9 @@ const CHUNK: usize = 4 * 1024 * 1024;
 static CANCEL_FILE: OnceLock<Option<String>> = OnceLock::new();
 /// Optional path to an "editing finished" flag file (boot-file editor).
 static EDIT_DONE_FILE: OnceLock<Option<String>> = OnceLock::new();
+/// Optional path to a file the GUI writes with the partition the user chose to
+/// mount (or "__skip__"), in response to a "choose" event.
+static CHOICE_FILE: OnceLock<Option<String>> = OnceLock::new();
 
 fn flag_exists(cell: &OnceLock<Option<String>>) -> bool {
     cell.get()
@@ -67,6 +71,21 @@ struct Job {
     /// Optional path to a .bmap file to skip blank regions when writing.
     #[serde(default)]
     bmap_path: Option<String>,
+    /// HTTP Basic Auth credentials for a URL source (streamed directly).
+    #[serde(default)]
+    http_username: Option<String>,
+    #[serde(default)]
+    http_password: Option<String>,
+    /// If set, erase & format each device instead of writing an image.
+    #[serde(default)]
+    format: Option<FormatJob>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FormatJob {
+    filesystem: String,
+    label: String,
 }
 
 #[derive(Serialize)]
@@ -94,6 +113,8 @@ struct DeviceResult {
     checksum: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 
 /// Appends newline-delimited JSON progress events to the progress file.
@@ -113,6 +134,12 @@ impl Emitter {
             let _ = self.file.flush();
         }
     }
+    /// Emit an arbitrary JSON event (used for the "choose" event, which carries a
+    /// partition list that doesn't fit the fixed Progress shape).
+    fn emit_value(&mut self, v: &serde_json::Value) {
+        let _ = writeln!(self.file, "{v}");
+        let _ = self.file.flush();
+    }
 }
 
 fn main() {
@@ -128,6 +155,8 @@ fn main() {
     CANCEL_FILE.set(args.get(4).cloned()).ok();
     // Optional 5th arg: an "editing done" flag file for the boot-file editor.
     EDIT_DONE_FILE.set(args.get(5).cloned()).ok();
+    // Optional 6th arg: the partition-choice answer file.
+    CHOICE_FILE.set(args.get(6).cloned()).ok();
 
     let job: Job = match std::fs::read_to_string(job_path)
         .ok()
@@ -189,6 +218,11 @@ fn flash_one(job: &Job, device: &str, emitter: &mut Emitter) -> DeviceResult {
         device: Some(device.to_string()),
     });
 
+    // Erase/format path: no image write, no verify, no boot step.
+    if let Some(fmt) = &job.format {
+        return format_one(device, fmt, emitter);
+    }
+
     let (bytes_written, checksum) = match flash_one_inner(job, device, emitter) {
         Ok(v) => v,
         Err(e) => {
@@ -208,37 +242,128 @@ fn flash_one(job: &Job, device: &str, emitter: &mut Emitter) -> DeviceResult {
                 bytes_written: 0,
                 checksum: None,
                 error: Some(e),
+                warning: None,
             };
         }
     };
 
     // Post-write boot-partition step: copy files and/or hold it mounted for
-    // editing. Any failure here is reported, but the image is still written &
-    // verified (bytes_written/checksum preserved).
-    let need_boot = !job.boot_config_files.is_empty() || job.edit_boot;
-    if need_boot {
-        let fail = |emitter: &mut Emitter, reason: String| -> DeviceResult {
-            let msg = format!("Image written & verified, but {reason}");
+    // editing. This is a BONUS step — the image is already written & verified,
+    // so anything here (no FAT partition, mount failure) is a non-fatal warning,
+    // never a flash failure. Many images (e.g. plain ISOs) have no editable
+    // boot partition, and that's fine.
+    let warning: Option<String> = if job.edit_boot {
+        // The user wants to edit files: let them pick which partition to mount
+        // from the device we just wrote, rather than guessing by name.
+        run_partition_chooser(job, device, bytes_written, emitter)
+    } else if !job.boot_config_files.is_empty() {
+        // Drop-only (no interactive edit): auto-detect the FAT boot partition.
+        copy_to_boot(job, device, bytes_written, emitter)
+    } else {
+        None
+    };
+
+    DeviceResult {
+        ok: true,
+        device: device.to_string(),
+        bytes_written,
+        checksum: Some(checksum),
+        error: None,
+        warning,
+    }
+}
+
+/// Erase a device and lay down a fresh filesystem (the "Erase" utility).
+fn format_one(device: &str, fmt: &FormatJob, emitter: &mut Emitter) -> DeviceResult {
+    let result = format::run(device, &fmt.filesystem, &fmt.label, &mut |msg, frac| {
+        emitter.emit(&Progress {
+            phase: "formatting".into(),
+            fraction: frac,
+            bytes: 0,
+            total_bytes: None,
+            speed: 0.0,
+            eta: None,
+            message: Some(msg.to_string()),
+            device: Some(device.to_string()),
+        });
+    });
+    match result {
+        Ok(()) => DeviceResult {
+            ok: true,
+            device: device.to_string(),
+            bytes_written: 0,
+            checksum: None,
+            error: None,
+            warning: None,
+        },
+        Err(e) => {
             emitter.emit(&Progress {
                 phase: "failed".into(),
-                fraction: 1.0,
-                bytes: bytes_written,
-                total_bytes: Some(bytes_written),
+                fraction: 0.0,
+                bytes: 0,
+                total_bytes: None,
                 speed: 0.0,
                 eta: None,
-                message: Some(msg.clone()),
+                message: Some(e.clone()),
                 device: Some(device.to_string()),
             });
             DeviceResult {
                 ok: false,
                 device: device.to_string(),
-                bytes_written,
-                checksum: Some(checksum.clone()),
-                error: Some(msg),
+                bytes_written: 0,
+                checksum: None,
+                error: Some(e),
+                warning: None,
             }
-        };
+        }
+    }
+}
 
-        if !job.boot_config_files.is_empty() {
+/// Block until the GUI signals editing is finished (or cancels), with a cap.
+fn wait_for_edit_done() {
+    let deadline = Instant::now() + std::time::Duration::from_secs(3600);
+    while !edit_done() && !is_cancelled() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+}
+
+/// Block until the GUI writes the partition-choice file. Returns the chosen
+/// device path, or `None` if the user skipped/cancelled (or it timed out).
+fn wait_for_choice() -> Option<String> {
+    let path = CHOICE_FILE.get().and_then(|o| o.as_ref())?;
+    let deadline = Instant::now() + std::time::Duration::from_secs(3600);
+    loop {
+        if is_cancelled() {
+            return None;
+        }
+        if Path::new(path).exists() {
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            let trimmed = content.trim();
+            if trimmed.is_empty() || trimmed == "__skip__" {
+                return None;
+            }
+            return Some(trimmed.to_string());
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Auto-detect the FAT boot partition and copy the drop files onto it. Returns a
+/// non-fatal warning if there's nothing to mount or the copy fails.
+fn copy_to_boot(
+    job: &Job,
+    device: &str,
+    bytes_written: u64,
+    emitter: &mut Emitter,
+) -> Option<String> {
+    match bootconfig::mount_boot(device, None) {
+        Ok(mount) => {
             emitter.emit(&Progress {
                 phase: "configuring".into(),
                 fraction: 1.0,
@@ -252,23 +377,72 @@ fn flash_one(job: &Job, device: &str, emitter: &mut Emitter) -> DeviceResult {
                 )),
                 device: Some(device.to_string()),
             });
+            let warning = bootconfig::copy_files(&mount, &job.boot_config_files)
+                .err()
+                .map(|e| format!("could not copy boot files: {e}"));
+            bootconfig::unmount(mount);
+            warning
         }
+        Err(e) => Some(format!("no editable boot partition found ({e})")),
+    }
+}
 
-        let uid = if job.edit_boot { invoking_uid() } else { None };
-        let mount = match bootconfig::mount_boot(device, uid) {
-            Ok(m) => m,
-            Err(e) => return fail(emitter, format!("could not mount boot partition: {e}")),
-        };
+/// Offer the device's partitions to the user, mount the one they pick, copy any
+/// drop files, then hold it mounted for editing until they're done.
+fn run_partition_chooser(
+    job: &Job,
+    device: &str,
+    bytes_written: u64,
+    emitter: &mut Emitter,
+) -> Option<String> {
+    let parts = bootconfig::list_partitions(device);
+    if parts.is_empty() {
+        return Some("no mountable partitions found on the written device".into());
+    }
 
-        if !job.boot_config_files.is_empty() {
-            if let Err(e) = bootconfig::copy_files(&mount, &job.boot_config_files) {
-                bootconfig::unmount(mount);
-                return fail(emitter, format!("copying boot files failed: {e}"));
+    // Ask the GUI to present the choices.
+    emitter.emit_value(&serde_json::json!({
+        "phase": "choose",
+        "fraction": 1.0,
+        "bytes": bytes_written,
+        "totalBytes": bytes_written,
+        "device": device,
+        "partitions": parts,
+    }));
+
+    let chosen = match wait_for_choice() {
+        Some(p) => p,
+        // Skipped or cancelled — the image is already written & verified.
+        None => return None,
+    };
+
+    let fstype = parts
+        .iter()
+        .find(|p| p.path == chosen)
+        .map(|p| p.fstype.clone())
+        .unwrap_or_default();
+
+    match bootconfig::mount_partition(&chosen, &fstype, invoking_uid()) {
+        Ok(mount) => {
+            if !job.boot_config_files.is_empty() {
+                emitter.emit(&Progress {
+                    phase: "configuring".into(),
+                    fraction: 1.0,
+                    bytes: bytes_written,
+                    total_bytes: Some(bytes_written),
+                    speed: 0.0,
+                    eta: None,
+                    message: Some(format!(
+                        "Copying {} file(s) to {chosen}",
+                        job.boot_config_files.len()
+                    )),
+                    device: Some(device.to_string()),
+                });
+                if let Err(e) = bootconfig::copy_files(&mount, &job.boot_config_files) {
+                    bootconfig::unmount(mount);
+                    return Some(format!("could not copy files: {e}"));
+                }
             }
-        }
-
-        if job.edit_boot {
-            // Hand the mountpoint to the GUI and wait until the user is done.
             emitter.emit(&Progress {
                 phase: "editing".into(),
                 fraction: 1.0,
@@ -280,28 +454,10 @@ fn flash_one(job: &Job, device: &str, emitter: &mut Emitter) -> DeviceResult {
                 device: Some(device.to_string()),
             });
             wait_for_edit_done();
+            bootconfig::unmount(mount);
+            None
         }
-
-        bootconfig::unmount(mount);
-    }
-
-    DeviceResult {
-        ok: true,
-        device: device.to_string(),
-        bytes_written,
-        checksum: Some(checksum),
-        error: None,
-    }
-}
-
-/// Block until the GUI signals editing is finished (or cancels), with a cap.
-fn wait_for_edit_done() {
-    let deadline = Instant::now() + std::time::Duration::from_secs(3600);
-    while !edit_done() && !is_cancelled() {
-        if Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        Err(e) => Some(format!("could not mount {chosen}: {e}")),
     }
 }
 
@@ -391,7 +547,12 @@ fn flash_one_inner(
     } else {
         // Source is a local file OR an http(s) URL streamed directly to the
         // device (write-while-download), then decompressed on the fly.
-        let raw = source::open_raw(&job.image_path).map_err(|e| e.to_string())?;
+        let raw = source::open_raw(
+            &job.image_path,
+            job.http_username.as_deref(),
+            job.http_password.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
         let (mut reader, counter) = source::streaming_decoder(raw, &job.compression)
             .map_err(|e| e.to_string())?;
         let progress = &mut |written: u64| {

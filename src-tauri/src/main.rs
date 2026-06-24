@@ -12,6 +12,17 @@ mod settings;
 use tauri::Emitter;
 
 fn main() {
+    // WebKitGTK's DMABUF renderer is broken under Wayland on several drivers
+    // (most notably the NVIDIA proprietary driver), crashing with
+    // "Error 71 (Protocol error) dispatching to Wayland display". Disabling it
+    // is a universally safe fallback — every GPU still renders correctly via the
+    // standard path; only a GPU optimisation (irrelevant for this UI) is skipped.
+    // Linux-only, and we honour an explicit override so power users can opt out.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     tauri::Builder::default()
         .setup(|app| {
             // Poll for drive changes and notify the UI.
@@ -40,10 +51,12 @@ fn main() {
             commands::forget_temp,
             settings::get_settings,
             settings::set_settings,
+            settings::add_recent_url,
             download::download_image,
             flash::start_flash,
             flash::cancel_flash,
             flash::finish_edit,
+            flash::choose_partition,
             bootedit::boot_list,
             bootedit::boot_read_text,
             bootedit::boot_write_text,
@@ -51,6 +64,7 @@ fn main() {
             bootedit::boot_delete,
             bootedit::boot_add,
             commands::open_external,
+            commands::os_platform,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Pyro");

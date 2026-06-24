@@ -21,6 +21,8 @@ use crate::models::{FlashRequest, FlashResult};
 static ACTIVE_CANCEL: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// Path of the "editing done" flag file for the in-flight flash, if any.
 static ACTIVE_EDIT_DONE: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// Path of the partition-choice answer file for the in-flight flash, if any.
+static ACTIVE_CHOICE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,6 +35,14 @@ struct JobOut {
     boot_config_files: Vec<String>,
     edit_boot: bool,
     bmap_path: Option<String>,
+    /// HTTP Basic Auth for a URL source, streamed by the helper.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_password: Option<String>,
+    /// If set, erase & format the devices instead of writing an image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<crate::models::FormatSpec>,
 }
 
 fn helper_path() -> Result<PathBuf, String> {
@@ -44,18 +54,42 @@ fn helper_path() -> Result<PathBuf, String> {
         "pyro-helper"
     };
     let candidate = dir.join(name);
-    if candidate.exists() {
-        Ok(candidate)
-    } else {
-        Err(format!(
+    if !candidate.exists() {
+        return Err(format!(
             "privileged helper not found at {}",
             candidate.display()
-        ))
+        ));
     }
+
+    // Inside an AppImage the helper lives on a FUSE mount that only the invoking
+    // user can read; pkexec runs it as root, which can't access that mount. Stage
+    // a copy in the temp dir (world-readable) so the elevated process can exec it.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("APPIMAGE").is_some() {
+        use std::os::unix::fs::PermissionsExt;
+        let staged = std::env::temp_dir().join("pyro-helper");
+        if std::fs::copy(&candidate, &staged).is_ok() {
+            let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755));
+            return Ok(staged);
+        }
+    }
+
+    Ok(candidate)
 }
 
+/// Flashing blocks for the whole write+verify (it waits on the elevated helper).
+/// Tauri runs synchronous commands on the main thread, so doing that work here
+/// directly would freeze the UI ("not responding") and stall Cancel. Run it as
+/// an async command that offloads the blocking work to a dedicated thread, while
+/// the progress-tail thread keeps emitting events to the UI.
 #[tauri::command]
-pub fn start_flash(app: AppHandle, req: FlashRequest) -> Result<Vec<FlashResult>, String> {
+pub async fn start_flash(app: AppHandle, req: FlashRequest) -> Result<Vec<FlashResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || run_flash(app, req))
+        .await
+        .map_err(|e| format!("flash task failed: {e}"))?
+}
+
+fn run_flash(app: AppHandle, req: FlashRequest) -> Result<Vec<FlashResult>, String> {
     let helper = helper_path()?;
 
     let nonce = SystemTime::now()
@@ -69,6 +103,7 @@ pub fn start_flash(app: AppHandle, req: FlashRequest) -> Result<Vec<FlashResult>
     let res_path = work.join("result.json");
     let cancel_path = work.join("cancel.flag");
     let edit_done_path = work.join("edit-done.flag");
+    let choice_path = work.join("choice.txt");
 
     let job = JobOut {
         image_path: req.image.path.clone(),
@@ -79,6 +114,9 @@ pub fn start_flash(app: AppHandle, req: FlashRequest) -> Result<Vec<FlashResult>
         boot_config_files: req.boot_config_files.clone(),
         edit_boot: req.edit_boot,
         bmap_path: req.image.bmap_path.clone(),
+        http_username: req.image.auth.as_ref().map(|a| a.username.clone()),
+        http_password: req.image.auth.as_ref().map(|a| a.password.clone()),
+        format: req.format.clone(),
     };
     fs::write(
         &job_path,
@@ -89,6 +127,7 @@ pub fn start_flash(app: AppHandle, req: FlashRequest) -> Result<Vec<FlashResult>
 
     *ACTIVE_CANCEL.lock().unwrap() = Some(cancel_path.clone());
     *ACTIVE_EDIT_DONE.lock().unwrap() = Some(edit_done_path.clone());
+    *ACTIVE_CHOICE.lock().unwrap() = Some(choice_path.clone());
 
     // Tail the progress file and forward events to the UI.
     let stop = Arc::new(AtomicBool::new(false));
@@ -101,6 +140,7 @@ pub fn start_flash(app: AppHandle, req: FlashRequest) -> Result<Vec<FlashResult>
         &res_path,
         &cancel_path,
         &edit_done_path,
+        &choice_path,
     );
 
     // Let the tail flush the final lines, then stop it.
@@ -109,6 +149,7 @@ pub fn start_flash(app: AppHandle, req: FlashRequest) -> Result<Vec<FlashResult>
     let _ = tail.join();
     *ACTIVE_CANCEL.lock().unwrap() = None;
     *ACTIVE_EDIT_DONE.lock().unwrap() = None;
+    *ACTIVE_CHOICE.lock().unwrap() = None;
 
     let results: Vec<FlashResult> = fs::read_to_string(&res_path)
         .ok()
@@ -137,6 +178,20 @@ pub fn cancel_flash() {
 pub fn finish_edit() {
     if let Some(path) = ACTIVE_EDIT_DONE.lock().unwrap().clone() {
         let _ = fs::write(path, b"1");
+    }
+}
+
+/// Answer a "choose" event: tell the helper which partition to mount, or
+/// "__skip__" to skip the boot-edit step entirely.
+#[tauri::command]
+pub fn choose_partition(path: String) {
+    if let Some(file) = ACTIVE_CHOICE.lock().unwrap().clone() {
+        let answer = if path.trim().is_empty() {
+            "__skip__".to_string()
+        } else {
+            path
+        };
+        let _ = fs::write(file, answer.as_bytes());
     }
 }
 
@@ -186,6 +241,7 @@ fn run_elevated(
     res: &Path,
     cancel: &Path,
     edit_done: &Path,
+    choice: &Path,
 ) -> Result<bool, String> {
     let status = Command::new("pkexec")
         .arg(helper)
@@ -194,6 +250,7 @@ fn run_elevated(
         .arg(res)
         .arg(cancel)
         .arg(edit_done)
+        .arg(choice)
         .status()
         .map_err(|e| format!("could not launch pkexec: {e}"))?;
     match status.code() {
@@ -212,17 +269,19 @@ fn run_elevated(
     res: &Path,
     cancel: &Path,
     edit_done: &Path,
+    choice: &Path,
 ) -> Result<bool, String> {
     // Build a /bin/sh command line (paths single-quoted) and run it via
     // AppleScript's privileged shell, which offers Touch ID on supported Macs.
     let cmd = format!(
-        "{} {} {} {} {} {}",
+        "{} {} {} {} {} {} {}",
         sh_quote(helper),
         sh_quote(job),
         sh_quote(prog),
         sh_quote(res),
         sh_quote(cancel),
         sh_quote(edit_done),
+        sh_quote(choice),
     );
     let script = format!(
         "do shell script \"{}\" with administrator privileges",
@@ -248,6 +307,7 @@ fn run_elevated(
     _res: &Path,
     _cancel: &Path,
     _edit_done: &Path,
+    _choice: &Path,
 ) -> Result<bool, String> {
     Err("Elevated flashing is not supported on this platform yet".into())
 }
