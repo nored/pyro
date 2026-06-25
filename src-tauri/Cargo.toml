@@ -1,6 +1,6 @@
 [package]
 name = "pyro"
-version = "0.2.0"
+version = "0.3.0"
 description = "Pyro — flash OS images to USB drives & SD cards"
 authors = ["Pyro contributors"]
 edition = "2021"
