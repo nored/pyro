@@ -23,6 +23,86 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const CHUNK: usize = 4 * 1024 * 1024;
+/// Flush the page cache to the device this often during a write. Without it, a
+/// fast source (a local file) fills the kernel with gigabytes of dirty pages,
+/// progress races to 99% while the data is still in RAM, and the final sync then
+/// stalls for a long time — the classic "stuck at 99%". Syncing periodically
+/// caps in-flight data so progress tracks real USB throughput. (A slow source
+/// like a streamed URL is naturally paced and never hits this.)
+const SYNC_EVERY: u64 = 64 * 1024 * 1024;
+/// Alignment for O_DIRECT I/O: buffer address, transfer length, and file offset
+/// must all be multiples of the device's logical block size. 4096 is a multiple
+/// of both common sizes (512 and 4096), so it satisfies either. CHUNK is already
+/// a multiple of this.
+#[cfg(target_os = "linux")]
+const ALIGN: usize = 4096;
+
+/// A heap buffer whose start address is aligned to `ALIGN`, as O_DIRECT requires.
+/// A plain `Vec<u8>` has no such guarantee.
+#[cfg(target_os = "linux")]
+struct AlignedBuf {
+    ptr: *mut u8,
+    len: usize,
+    layout: std::alloc::Layout,
+}
+
+#[cfg(target_os = "linux")]
+impl AlignedBuf {
+    fn new(len: usize) -> Self {
+        let layout = std::alloc::Layout::from_size_align(len, ALIGN).unwrap();
+        // SAFETY: layout has non-zero size; we check for null below.
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        AlignedBuf { ptr, len, layout }
+    }
+    fn as_mut(&mut self) -> &mut [u8] {
+        // SAFETY: ptr is a valid allocation of `len` bytes for this buffer's life.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: as above, shared borrow.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        // SAFETY: ptr/layout are exactly what alloc returned.
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) }
+    }
+}
+
+/// Open the target device for writing. On Linux, try O_DIRECT first (bypasses the
+/// page cache → real device-speed progress and no end-of-write stall, the way
+/// rpi-imager does it). Returns `(file, is_direct)`; falls back to a buffered
+/// handle (paired with periodic syncing) if O_DIRECT isn't available — some
+/// filesystems/devices reject it. `want_direct` is false for write paths that
+/// can't satisfy alignment (zip, bmap), forcing the buffered handle.
+fn open_device(device: &str, want_direct: bool) -> Result<(File, bool), String> {
+    #[cfg(target_os = "linux")]
+    if want_direct {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Ok(f) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(device)
+        {
+            return Ok((f, true));
+        }
+    }
+    let _ = want_direct;
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(device)
+        .map_err(|e| format!("cannot open {device}: {e}"))?;
+    Ok((f, false))
+}
 
 /// Optional path to a cancellation flag file; if it appears, abort.
 static CANCEL_FILE: OnceLock<Option<String>> = OnceLock::new();
@@ -468,12 +548,11 @@ fn flash_one_inner(
 ) -> Result<(u64, String), String> {
     unmount_device(device);
 
-    let mut dev = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(device)
-        .map_err(|e| format!("cannot open {device}: {e}"))?;
+    // O_DIRECT needs block-aligned, sequential writes — only the plain streaming
+    // path can guarantee that. zip (random-access reads) and bmap (scattered
+    // seeks) use the buffered handle with periodic syncing instead.
+    let want_direct = job.compression != "zip" && job.bmap_path.is_none();
+    let (mut dev, is_direct) = open_device(device, want_direct)?;
 
     let mut hasher = Sha256::new();
     let started = Instant::now();
@@ -562,12 +641,29 @@ fn flash_one_inner(
         if let Some(bm) = &bmap {
             write_with_bmap(&mut reader, &mut dev, bm, &mut hasher, progress)
                 .map_err(|e| format!("write error: {e}"))?
+        } else if is_direct {
+            // Direct I/O: aligned, page-cache-bypassing writes (rpi-imager's fast
+            // path). No periodic sync needed — nothing is buffered in RAM.
+            pump_direct(&mut reader, &mut dev, &mut hasher, progress)
+                .map_err(|e| format!("write error: {e}"))?
         } else {
             pump(&mut reader, &mut dev, &mut hasher, progress)
                 .map_err(|e| format!("write error: {e}"))?
         }
     };
 
+    // Any data still in the page cache gets flushed here. Periodic syncing during
+    // the write keeps this small, but label it so the bar never looks frozen.
+    emitter.emit(&Progress {
+        phase: "finalizing".into(),
+        fraction: 0.999,
+        bytes: bytes_written,
+        total_bytes: Some(bytes_written),
+        speed: 0.0,
+        eta: None,
+        message: None,
+        device: Some(device.to_string()),
+    });
     dev.flush().map_err(|e| e.to_string())?;
     dev.sync_all().map_err(|e| e.to_string())?;
 
@@ -576,6 +672,8 @@ fn flash_one_inner(
     if job.validate {
         if let Some(bm) = &bmap {
             verify_with_bmap(device, &mut dev, bm, &checksum, emitter)?;
+        } else if is_direct {
+            verify_direct(device, &mut dev, bytes_written, &checksum, emitter)?;
         } else {
             verify(device, &mut dev, bytes_written, &checksum, emitter)?;
         }
@@ -596,6 +694,7 @@ fn pump(
 ) -> io::Result<u64> {
     let mut buf = vec![0u8; CHUNK];
     let mut total = 0u64;
+    let mut since_sync = 0u64;
     loop {
         if is_cancelled() {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled by user"));
@@ -607,9 +706,114 @@ fn pump(
         dev.write_all(&buf[..n])?;
         hasher.update(&buf[..n]);
         total += n as u64;
+        since_sync += n as u64;
+        if since_sync >= SYNC_EVERY {
+            dev.sync_data()?;
+            since_sync = 0;
+        }
         on_progress(total);
     }
     Ok(total)
+}
+
+/// Direct-I/O variant of `pump` (Linux O_DIRECT). Writes must be aligned and a
+/// multiple of the device block size, so we fill a whole aligned buffer before
+/// writing and zero-pad the final short block up to `ALIGN`. We hash only the
+/// real image bytes (not the padding) so readback verification still matches.
+/// No periodic sync: O_DIRECT already bypasses the page cache.
+#[cfg(target_os = "linux")]
+fn pump_direct(
+    reader: &mut dyn Read,
+    dev: &mut File,
+    hasher: &mut Sha256,
+    on_progress: &mut dyn FnMut(u64),
+) -> io::Result<u64> {
+    let mut buf = AlignedBuf::new(CHUNK);
+    let mut total = 0u64;
+    loop {
+        if is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled by user"));
+        }
+        // Fill the whole buffer so each write is a full aligned CHUNK; a short
+        // read mid-stream would otherwise produce an unaligned write length.
+        let n = read_block(reader, buf.as_mut())?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf.as_ref()[..n]);
+        // Round the write length up to ALIGN (<= CHUNK, since CHUNK is a multiple
+        // of ALIGN), zeroing the pad bytes. Only the final block is ever padded.
+        let write_len = if n % ALIGN == 0 {
+            n
+        } else {
+            let pad = ALIGN - (n % ALIGN);
+            buf.as_mut()[n..n + pad].fill(0);
+            n + pad
+        };
+        dev.write_all(&buf.as_ref()[..write_len])?;
+        total += n as u64;
+        on_progress(total);
+    }
+    Ok(total)
+}
+
+/// Direct-I/O readback verification (Linux O_DIRECT). Reads are aligned too: we
+/// read full aligned blocks and hash only up to `bytes_written`, ignoring any
+/// padding written past the image's end.
+#[cfg(target_os = "linux")]
+fn verify_direct(
+    device: &str,
+    dev: &mut File,
+    bytes_written: u64,
+    expected: &str,
+    emitter: &mut Emitter,
+) -> Result<(), String> {
+    dev.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buf = AlignedBuf::new(CHUNK);
+    let mut read_total = 0u64;
+    let mut last_emit = Instant::now();
+    while read_total < bytes_written {
+        if is_cancelled() {
+            return Err("cancelled by user".into());
+        }
+        let remaining = bytes_written - read_total;
+        let to_read = if remaining >= CHUNK as u64 {
+            CHUNK
+        } else {
+            // Round up to ALIGN so the read length stays block-aligned.
+            (((remaining as usize) + ALIGN - 1) / ALIGN) * ALIGN
+        };
+        let n = read_block(dev, &mut buf.as_mut()[..to_read]).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        let use_n = (n as u64).min(remaining) as usize;
+        hasher.update(&buf.as_ref()[..use_n]);
+        read_total += use_n as u64;
+        if last_emit.elapsed().as_secs_f64() > 0.15 {
+            last_emit = Instant::now();
+            emitter.emit(&Progress {
+                phase: "validating".into(),
+                fraction: (read_total as f64 / bytes_written.max(1) as f64).min(0.999),
+                bytes: read_total,
+                total_bytes: Some(bytes_written),
+                speed: 0.0,
+                eta: None,
+                message: None,
+                device: Some(device.to_string()),
+            });
+        }
+    }
+    if read_total != bytes_written {
+        return Err(format!(
+            "validation read short: {read_total} of {bytes_written} bytes"
+        ));
+    }
+    if hex(&hasher.finalize()) != expected {
+        return Err("validation failed: written data does not match image".into());
+    }
+    Ok(())
 }
 
 /// Read exactly `buf.len()` bytes (or fewer at EOF), looping over short reads.
@@ -640,6 +844,7 @@ fn write_with_bmap(
     let mut buf = vec![0u8; bs];
     let mut block: u64 = 0;
     let mut written = 0u64;
+    let mut since_sync = 0u64;
     let mut ri = 0;
     loop {
         if is_cancelled() {
@@ -660,6 +865,11 @@ fn write_with_bmap(
             dev.write_all(&buf[..n])?;
             hasher.update(&buf[..n]);
             written += n as u64;
+            since_sync += n as u64;
+            if since_sync >= SYNC_EVERY {
+                dev.sync_data()?;
+                since_sync = 0;
+            }
             on_progress(written);
         }
         block += 1;
@@ -741,6 +951,7 @@ fn write_from_zip(
 
     let mut buf = vec![0u8; CHUNK];
     let mut written = 0u64;
+    let mut since_sync = 0u64;
     loop {
         if is_cancelled() {
             return Err("cancelled by user".into());
@@ -752,6 +963,11 @@ fn write_from_zip(
         dev.write_all(&buf[..n]).map_err(|e| e.to_string())?;
         hasher.update(&buf[..n]);
         written += n as u64;
+        since_sync += n as u64;
+        if since_sync >= SYNC_EVERY {
+            dev.sync_data().map_err(|e| e.to_string())?;
+            since_sync = 0;
+        }
         on_progress(written as f64 / total as f64, written);
     }
     Ok(written)

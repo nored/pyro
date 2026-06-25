@@ -19,3 +19,6 @@ bzip2 = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 ureq = "2"
 base64 = "0.22"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
