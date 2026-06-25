@@ -56,6 +56,7 @@ export default function App() {
     partitions: PartitionInfo[];
   } | null>(null);
   const [editAddNonce, setEditAddNonce] = useState(0);
+  const [bootError, setBootError] = useState<string | null>(null);
   const editingRef = useRef<{ dir: string } | null>(null);
   editingRef.current = editing;
   const [settings, setSettings] = useState<Settings>({
@@ -154,7 +155,11 @@ export default function App() {
       if (editingRef.current) {
         pyro
           .bootAdd(editingRef.current.dir, paths)
-          .then(() => setEditAddNonce((n) => n + 1));
+          .then(() => {
+            setBootError(null);
+            setEditAddNonce((n) => n + 1);
+          })
+          .catch((e) => setBootError(`Couldn't add file: ${String(e)}`));
         return;
       }
       let zone: string | null = null;
@@ -280,11 +285,16 @@ export default function App() {
         <BootEditor
           dir={editing.dir}
           refreshKey={editAddNonce}
+          extraError={bootError}
           onAddFiles={async () => {
             const files = await pyro.selectBootConfigFiles();
-            if (files.length) {
+            if (!files.length) return;
+            try {
               await pyro.bootAdd(editing.dir, files);
+              setBootError(null);
               setEditAddNonce((n) => n + 1);
+            } catch (e) {
+              setBootError(`Couldn't add file: ${String(e)}`);
             }
           }}
           onDone={() => pyro.finishEdit()}
@@ -1050,11 +1060,13 @@ function Toggle({
 function BootEditor({
   dir,
   refreshKey,
+  extraError,
   onAddFiles,
   onDone,
 }: {
   dir: string;
   refreshKey: number;
+  extraError: string | null;
   onAddFiles: () => void;
   onDone: () => void;
 }) {
@@ -1063,8 +1075,10 @@ function BootEditor({
   const [renaming, setRenaming] = useState<{ name: string; value: string } | null>(
     null,
   );
+  const [creating, setCreating] = useState<string | null>(null);
   const [finishing, setFinishing] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const gutterRef = useRef<HTMLDivElement>(null);
 
   const join = (name: string) => `${dir}/${name}`;
   const refresh = useCallback(() => {
@@ -1102,6 +1116,27 @@ function BootEditor({
     await pyro.bootDelete(join(name));
     refresh();
   };
+  const createFile = async () => {
+    const name = (creating ?? '').trim();
+    if (!name) return;
+    if (name.includes('/') || name.startsWith('.')) {
+      setErr(`Invalid file name: ${name}`);
+      return;
+    }
+    if (entries.some((e) => e.name === name)) {
+      setErr(`${name} already exists`);
+      return;
+    }
+    try {
+      await pyro.bootWriteText(join(name), '');
+      setCreating(null);
+      setErr(null);
+      refresh();
+      setOpen({ name, content: '' });
+    } catch (e) {
+      setErr(`Can't create ${name}: ${e instanceof Error ? e.message : e}`);
+    }
+  };
 
   return (
     <main className="editor">
@@ -1113,6 +1148,15 @@ function BootEditor({
           </span>
         </div>
         <span style={{ flex: 1 }} />
+        <button
+          className="btn"
+          onClick={() => {
+            setOpen(null);
+            setCreating('');
+          }}
+        >
+          {t('editor.new')}
+        </button>
         <button className="btn" onClick={onAddFiles}>
           {t('editor.add')}
         </button>
@@ -1128,7 +1172,9 @@ function BootEditor({
         </button>
       </div>
 
-      {err && <p style={{ color: 'var(--bad)', fontSize: 13 }}>{err}</p>}
+      {(err || extraError) && (
+        <p style={{ color: 'var(--bad)', fontSize: 13 }}>{err || extraError}</p>
+      )}
 
       {open ? (
         <div className="editor-file">
@@ -1142,16 +1188,48 @@ function BootEditor({
               {t('editor.save')}
             </button>
           </div>
-          <textarea
-            className="editor-textarea"
-            value={open.content}
-            spellCheck={false}
-            onChange={(e) => setOpen({ ...open, content: e.target.value })}
-          />
+          <div className="editor-textarea-wrap">
+            <div className="editor-gutter" ref={gutterRef} aria-hidden="true">
+              {open.content.split('\n').map((_, i) => (
+                <div key={i}>{i + 1}</div>
+              ))}
+            </div>
+            <textarea
+              className="editor-textarea"
+              value={open.content}
+              spellCheck={false}
+              onChange={(e) => setOpen({ ...open, content: e.target.value })}
+              onScroll={(e) => {
+                if (gutterRef.current)
+                  gutterRef.current.scrollTop = e.currentTarget.scrollTop;
+              }}
+            />
+          </div>
         </div>
       ) : (
         <div className="editor-list">
-          {entries.length === 0 ? (
+          {creating !== null && (
+            <div className="editor-row">
+              <input
+                className="url-input"
+                value={creating}
+                autoFocus
+                placeholder={t('editor.newPlaceholder')}
+                onChange={(e) => setCreating(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') createFile();
+                  if (e.key === 'Escape') setCreating(null);
+                }}
+              />
+              <button className="link" onClick={createFile}>
+                OK
+              </button>
+              <button className="link" onClick={() => setCreating(null)}>
+                ✕
+              </button>
+            </div>
+          )}
+          {entries.length === 0 && creating === null ? (
             <p className="muted">{t('editor.empty')}</p>
           ) : (
             entries.map((en) => (

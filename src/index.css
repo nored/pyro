@@ -573,12 +573,38 @@ button {
   align-items: center;
   gap: 10px;
 }
-.editor-textarea {
+.editor-textarea-wrap {
   flex: 1;
-  resize: none;
+  display: flex;
+  min-height: 0;
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-radius: var(--radius);
+  overflow: hidden;
+}
+.editor-textarea-wrap:focus-within {
+  border-color: var(--ember);
+}
+/* Line-number gutter; font metrics & vertical padding must match the textarea
+   so rows line up. Scroll is synced from the textarea's onScroll. */
+.editor-gutter {
+  flex: 0 0 auto;
+  overflow: hidden;
+  padding: 12px 8px 12px 12px;
+  text-align: right;
+  color: var(--text-faint);
+  background: var(--bg-elev-2);
+  border-right: 1px solid var(--border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  user-select: none;
+}
+.editor-textarea {
+  flex: 1;
+  resize: none;
+  background: transparent;
+  border: none;
   color: var(--text);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 13px;
@@ -589,5 +615,4 @@ button {
 }
 .editor-textarea:focus {
   outline: none;
-  border-color: var(--ember);
 }
