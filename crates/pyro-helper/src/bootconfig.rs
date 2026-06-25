@@ -198,19 +198,38 @@ fn mount_partition_linux(path: &str, fstype: &str, uid: Option<u32>) -> Result<M
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
     let fat = ["vfat", "fat", "fat12", "fat16", "fat32", "msdos"];
+    let is_fat = fat.contains(&fstype.to_lowercase().as_str());
     let mut cmd = Command::new("mount");
-    if let Some(uid) = uid {
-        // uid=/gid= only applies to FAT; other filesystems carry their own
-        // ownership, so we mount them as-is.
-        if fat.contains(&fstype.to_lowercase().as_str()) {
-            cmd.arg("-o").arg(format!("uid={uid},gid={uid}"));
-        }
+    if is_fat {
+        // FAT has no real on-disk ownership — it's synthesized from mount
+        // options. The boot editor runs in the unprivileged GUI process, so the
+        // mount must be writable by the invoking user. uid=/gid= hands it to
+        // that user when we know who they are; umask=000 makes it writable
+        // regardless (covers the case where the elevation tool didn't pass the
+        // invoking uid through, which otherwise leaves the volume root-owned and
+        // read-only to the GUI — files appear, but add/edit silently fail).
+        let opts = match uid {
+            Some(uid) => format!("uid={uid},gid={uid},umask=000"),
+            None => "umask=000".to_string(),
+        };
+        cmd.arg("-o").arg(opts);
     }
     cmd.arg(path).arg(&dir);
     let ok = cmd.status().map_err(|e| e.to_string())?.success();
     if !ok {
         let _ = std::fs::remove_dir(&dir);
         return Err(format!("failed to mount {path}"));
+    }
+    // Non-FAT filesystems (ext4 etc.) carry real ownership and ignore uid=/umask,
+    // so they mount root-owned. Hand the mount root to the invoking user so the
+    // GUI editor can write there too.
+    if !is_fat {
+        if let Some(uid) = uid {
+            let _ = Command::new("chown")
+                .arg(format!("{uid}:{uid}"))
+                .arg(&dir)
+                .status();
+        }
     }
     Ok(Mount {
         dir,
